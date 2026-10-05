@@ -1,0 +1,57 @@
+services:
+  app:
+    build:
+      context: .
+    environment:
+      APP_ENV: "${APP_ENV:-development}"
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      DATABASE_URL: "sqlite+aiosqlite:////app/data/teambot.db"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      SQLITE_BUSY_TIMEOUT_MS: "${SQLITE_BUSY_TIMEOUT_MS:-5000}"
+      SQLITE_BACKUP_DIR: "/app/data/backups"
+      SQLITE_BACKUP_CRON: "${SQLITE_BACKUP_CRON:-0 3 * * *}"
+      INITIAL_TEAM_NAME: "${INITIAL_TEAM_NAME:-Команда}"
+      ACCESS_CODE_TTL_MINUTES: "${ACCESS_CODE_TTL_MINUTES:-15}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_BOOTSTRAP_OWNER_ID: "${TELEGRAM_BOOTSTRAP_OWNER_ID:-}"
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - teambot_sqlite:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-teambot}"
+      POSTGRES_USER: "${POSTGRES_USER:-teambot}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-change-me}"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - teambot_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  teambot_sqlite:
+  teambot_postgres:
+
+# Публичные webhooks потребуют reverse proxy с HTTPS; на M1 используется long polling.

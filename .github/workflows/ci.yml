@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: teambot_test
+          POSTGRES_USER: teambot
+          POSTGRES_PASSWORD: teambot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U teambot -d teambot_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    strategy:
+      fail-fast: false
+      matrix:
+        database:
+          - sqlite+aiosqlite:///./ci.db
+          - postgresql+asyncpg://teambot:teambot@127.0.0.1:5432/teambot_test
+    env:
+      DATABASE_URL: ${{ matrix.database }}
+      APP_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --all-groups
+      - run: uv run ruff check .
+      - run: uv run mypy
+      - run: uv run alembic upgrade head
+      - run: uv run alembic check
+      - run: uv run pytest

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Виртуальные окружения и локальные настройки
+.venv/
+.env
+
+# Данные приложения
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Черновики технического задания
+tz/
+
+# IDE и ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
