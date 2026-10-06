@@ -31,7 +31,7 @@ from teambot.core.models import (
     TeamContext,
     role_allows,
 )
-from teambot.core.ports import EventDeduplicator
+from teambot.core.ports import ChatPresence, EventDeduplicator
 from teambot.core.services.ideas import IdeaService
 from teambot.core.services.identity import IdentityService
 from teambot.core.services.tasks import TaskService
@@ -72,12 +72,18 @@ class Orchestrator:
         identity: IdentityService,
         tasks: TaskService,
         ideas: IdeaService,
+        presence: ChatPresence | None = None,
     ) -> None:
-        """Создаёт оркестратор из портов и сервисов M1."""
+        """Создаёт оркестратор из портов и сервисов M1.
+
+        ``presence`` необязателен: без него ``/chats`` показывает привязки
+        со статусом «неизвестен», не обращаясь к каналу.
+        """
         self._deduplicator = deduplicator
         self._identity = identity
         self._tasks = tasks
         self._ideas = ideas
+        self._presence = presence
 
     async def handle(self, event: InboundEvent) -> list[OutboundMessage]:
         """Обрабатывает одно входящее событие идемпотентно.
@@ -127,12 +133,18 @@ class Orchestrator:
     ) -> str | OutboundMessage:
         if spec.handler == "start":
             if arguments:
-                await self._identity.accept_invite(identity, arguments, chat)
+                await self._identity.accept_invite(
+                    identity,
+                    arguments,
+                    chat,
+                    chat_title=event.chat_title,
+                )
             else:
                 await self._identity.register(
                     identity,
                     display_name=event.display_name,
                     chat=chat,
+                    chat_title=event.chat_title,
                 )
             return messages.START
         if spec.handler == "link":
@@ -144,7 +156,12 @@ class Orchestrator:
             return messages.format_link_code(code.code)
         if spec.handler == "bind" and arguments:
             user = await self._identity.identify(identity)
-            await self._identity.bind_chat(user.id, chat, arguments)
+            await self._identity.bind_chat(
+                user.id,
+                chat,
+                arguments,
+                title=event.chat_title,
+            )
             return messages.CHAT_BOUND
         if spec.handler == "help":
             role = await self._optional_role(identity, chat)
@@ -204,6 +221,19 @@ class Orchestrator:
             user_id, role = _parse_role_change(arguments)
             await self._identity.set_role(ctx, user_id, role)
             return messages.ROLE_CHANGED
+        if spec.handler == "kick":
+            await self._identity.kick(ctx, _parse_user_id(arguments))
+            return messages.MEMBER_REMOVED
+        if spec.handler == "unbind":
+            await self._identity.unbind_chat(ctx, chat)
+            return messages.CHAT_UNBOUND
+        if spec.handler == "leave":
+            await self._identity.leave(ctx)
+            return messages.LEFT_TEAM
+        if spec.handler == "chats":
+            team, chats = await self._identity.list_chats(ctx)
+            statuses = [await self._presence_status(item.ref) for item in chats]
+            return messages.format_chats(team, chats, statuses)
         raise ValidationError("Обработчик команды не реализован")
 
     async def _optional_role(
@@ -216,6 +246,19 @@ class Orchestrator:
         except (IdentityRequired, TeamRequired):
             return None
         return ctx.role
+
+    async def _presence_status(self, chat: ChatRef) -> bool | None:
+        """Спрашивает канал, не раскрывая платформу ядру.
+
+        Аргументы:
+            chat: привязка из хранилища команды.
+
+        Возвращает:
+            ``True``/``False`` если адаптер знает этот чат, иначе ``None``.
+        """
+        if self._presence is None:
+            return None
+        return await self._presence.is_member(chat)
 
     async def _list_tasks(self, ctx: TeamContext, arguments: str) -> list[Task]:
         normalized = arguments.casefold() or "open"
@@ -285,12 +328,15 @@ def _parse_role(value: str, *, default: Role) -> Role:
         raise ValidationError("Неизвестная роль") from error
 
 
+def _parse_user_id(value: str) -> UUID:
+    try:
+        return UUID(value.strip())
+    except ValueError as error:
+        raise ValidationError("Некорректный идентификатор пользователя") from error
+
+
 def _parse_role_change(value: str) -> tuple[UUID, Role]:
     user_id_text, separator, role_text = value.partition(" ")
     if not separator:
         raise ValidationError("Ожидаются пользователь и роль")
-    try:
-        user_id = UUID(user_id_text)
-    except ValueError as error:
-        raise ValidationError("Некорректный идентификатор пользователя") from error
-    return user_id, _parse_role(role_text.strip(), default=Role.MEMBER)
+    return _parse_user_id(user_id_text), _parse_role(role_text.strip(), default=Role.MEMBER)

@@ -11,11 +11,12 @@ from io import BytesIO
 
 import structlog
 from aiogram import Bot, Dispatcher
-from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import (
     BotCommand,
     BufferedInputFile,
+    Chat,
     Message,
 )
 from pydantic import SecretStr, field_validator
@@ -23,12 +24,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from teambot.core.commands import COMMANDS
 from teambot.core.events import Attachment, Capabilities, InboundEvent, OutboundMessage
-from teambot.core.models import CommandSpec
+from teambot.core.models import ChatRef, CommandSpec
 
 logger = structlog.get_logger(__name__)
 
 TELEGRAM_TEXT_LIMIT = 4096
 TELEGRAM_SOURCE = "telegram"
+_ACTIVE_MEMBER_STATUSES = {
+    ChatMemberStatus.CREATOR,
+    ChatMemberStatus.ADMINISTRATOR,
+    ChatMemberStatus.MEMBER,
+    ChatMemberStatus.RESTRICTED,
+}
 
 
 class TelegramSettings(BaseSettings):
@@ -96,6 +103,7 @@ def inbound_event_from_message(message: Message) -> InboundEvent:
         ts=occurred,
         raw={},
         display_name=display_name,
+        chat_title=_chat_title(message.chat),
     )
 
 
@@ -121,6 +129,20 @@ def _canonical_command_text(text: str | None) -> str | None:
 
 def _display_name(first_name: str, last_name: str | None) -> str:
     return " ".join(part for part in (first_name, last_name) if part).strip()
+
+
+def _chat_title(chat: Chat) -> str | None:
+    """Возвращает человекочитаемое имя чата без передачи типа платформы в ядро.
+
+    У групп есть ``title``. Личный чат его не имеет, поэтому берётся имя
+    собеседника. Пустое значение оставляет идентификатор как запасной
+    вариант на стороне форматирования ``/chats``.
+    """
+    if chat.title:
+        return chat.title
+    first_name = chat.first_name or ""
+    name = _display_name(first_name, chat.last_name)
+    return name or None
 
 
 def _attachments_from_message(message: Message) -> list[Attachment]:
@@ -217,6 +239,27 @@ class TelegramAdapter:
             for command in commands or list(COMMANDS)
         ]
         await self._bot.set_my_commands(bot_commands)
+
+    async def is_member(self, chat: ChatRef) -> bool | None:
+        """Проверяет, состоит ли бот в уже известном чате Telegram.
+
+        Bot API не отдаёт полный список групп. ``getChatMember`` работает
+        только для чата, чей идентификатор уже есть в привязке. Чужой
+        ``source`` возвращает ``None``, чтобы оркестратор спросил другой
+        адаптер. Ошибки доступа трактуются как «бота в чате нет», а не как
+        неизвестность: это типичный ответ после кика или удаления группы.
+        """
+        if chat.source != TELEGRAM_SOURCE:
+            return None
+        try:
+            chat_id = int(chat.external_chat_id)
+        except ValueError:
+            return False
+        try:
+            member = await self._bot.get_chat_member(chat_id, self._bot.id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            return False
+        return member.status in _ACTIVE_MEMBER_STATUSES
 
     async def _send_text(
         self,

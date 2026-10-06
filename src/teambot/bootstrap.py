@@ -93,13 +93,6 @@ def build_application(
         access_codes,
         code_lifetime=timedelta(minutes=resolved_settings.access_code_ttl_minutes),
     )
-    orchestrator = Orchestrator(
-        SqlEventDeduplicator(database.sessions),
-        identity_service,
-        TaskService(task_store),
-        IdeaService(idea_store, NormalizedIdeaIndex(idea_store)),
-    )
-
     resolved_telegram = (
         telegram_settings if telegram_settings is not None else load_telegram_settings()
     )
@@ -108,6 +101,13 @@ def build_application(
         telegram = TelegramAdapter(resolved_telegram)
     else:
         logger.info("telegram_channel_disabled")
+    orchestrator = Orchestrator(
+        SqlEventDeduplicator(database.sessions),
+        identity_service,
+        TaskService(task_store),
+        IdeaService(idea_store, NormalizedIdeaIndex(idea_store)),
+        presence=telegram,
+    )
 
     async def handle_scheduled(name: str, _payload: dict[str, JsonValue]) -> None:
         """Исполняет только инфраструктурные задания этапа M0."""

@@ -5,10 +5,11 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from teambot.core.errors import AccessCodeError, PermissionDenied
+from teambot.core.errors import AccessCodeError, PermissionDenied, ValidationError
 from teambot.core.models import (
     AccessCode,
     AccessCodePurpose,
+    BoundChat,
     ChatRef,
     ExternalIdentity,
     NewAccessCode,
@@ -43,6 +44,7 @@ class FakeTeamStore:
         self.team = team
         self.members = members
         self.chats: dict[ChatRef, UUID] = {}
+        self.chat_titles: dict[ChatRef, str | None] = {}
 
     async def get_context(self, team_id: UUID, user_id: UUID) -> TeamContext | None:
         member = next(
@@ -72,8 +74,26 @@ class FakeTeamStore:
         self.members.append(member)
         return member
 
-    async def bind_chat(self, ctx: TeamContext, chat: ChatRef) -> None:
+    async def bind_chat(
+        self,
+        ctx: TeamContext,
+        chat: ChatRef,
+        title: str | None = None,
+    ) -> None:
         self.chats[chat] = ctx.team_id
+        if title is not None:
+            self.chat_titles[chat] = title
+
+    async def list_chats(self, ctx: TeamContext) -> list[BoundChat]:
+        assert ctx.team_id == self.team.id
+        return [
+            BoundChat(ref, self.chat_titles.get(ref))
+            for ref, team_id in sorted(
+                self.chats.items(),
+                key=lambda item: (item[0].source, item[0].external_chat_id),
+            )
+            if team_id == ctx.team_id
+        ]
 
     async def set_role(
         self,
@@ -85,6 +105,16 @@ class FakeTeamStore:
         updated = TeamMember(current.user_id, current.display_name, role)
         self.members[self.members.index(current)] = updated
         return updated
+
+    async def remove_member(self, ctx: TeamContext, user_id: UUID) -> None:
+        assert ctx.team_id == self.team.id
+        self.members = [member for member in self.members if member.user_id != user_id]
+
+    async def unbind_chat(self, ctx: TeamContext, chat: ChatRef) -> None:
+        if self.chats.get(chat) != ctx.team_id:
+            raise ValidationError("Чат не привязан к этой команде")
+        del self.chats[chat]
+        self.chat_titles.pop(chat, None)
 
     async def find_owned_team(self, user_id: UUID) -> TeamContext | None:
         owners = [
@@ -274,3 +304,55 @@ async def test_link_and_bind_codes_are_single_use_and_expire() -> None:
     )
     with pytest.raises(AccessCodeError):
         await later.accept_invite(ExternalIdentity("channel-a", "late"), invite.code)
+
+
+async def test_kick_leave_and_unbind_respect_roles() -> None:
+    team = Team(uuid4(), "Команда")
+    owner = TeamMember(uuid4(), "Владелец", Role.OWNER)
+    admin = TeamMember(uuid4(), "Администратор", Role.ADMIN)
+    member = TeamMember(uuid4(), "Участник", Role.MEMBER)
+    other_admin = TeamMember(uuid4(), "Второй админ", Role.ADMIN)
+    teams = FakeTeamStore(team, [owner, admin, member, other_admin])
+    teams.chats[ChatRef("channel-a", "chat-1")] = team.id
+    service = IdentityService(FakeIdentityStore(), teams, FakeAccessCodeStore())
+    owner_ctx = TeamContext(team.id, owner.user_id, Role.OWNER)
+    admin_ctx = TeamContext(team.id, admin.user_id, Role.ADMIN)
+
+    with pytest.raises(PermissionDenied):
+        await service.kick(admin_ctx, owner.user_id)
+    with pytest.raises(PermissionDenied):
+        await service.kick(admin_ctx, other_admin.user_id)
+    with pytest.raises(PermissionDenied):
+        await service.kick(owner_ctx, owner.user_id)
+    with pytest.raises(PermissionDenied):
+        await service.leave(owner_ctx)
+
+    await service.kick(admin_ctx, member.user_id)
+    assert all(item.user_id != member.user_id for item in teams.members)
+
+    await service.leave(admin_ctx)
+    assert all(item.user_id != admin.user_id for item in teams.members)
+
+    await service.unbind_chat(owner_ctx, ChatRef("channel-a", "chat-1"))
+    assert ChatRef("channel-a", "chat-1") not in teams.chats
+    with pytest.raises(ValidationError):
+        await service.unbind_chat(owner_ctx, ChatRef("channel-a", "chat-1"))
+
+
+async def test_list_chats_is_owner_only_and_keeps_titles() -> None:
+    team = Team(uuid4(), "Команда")
+    owner = TeamMember(uuid4(), "Владелец", Role.OWNER)
+    admin = TeamMember(uuid4(), "Администратор", Role.ADMIN)
+    teams = FakeTeamStore(team, [owner, admin])
+    service = IdentityService(FakeIdentityStore(), teams, FakeAccessCodeStore())
+    owner_ctx = TeamContext(team.id, owner.user_id, Role.OWNER)
+    admin_ctx = TeamContext(team.id, admin.user_id, Role.ADMIN)
+    chat = ChatRef("channel-a", "chat-1")
+    await teams.bind_chat(owner_ctx, chat, title="Рабочий чат")
+
+    with pytest.raises(PermissionDenied):
+        await service.list_chats(admin_ctx)
+
+    listed_team, chats = await service.list_chats(owner_ctx)
+    assert listed_team.id == team.id
+    assert chats == [BoundChat(chat, "Рабочий чат")]

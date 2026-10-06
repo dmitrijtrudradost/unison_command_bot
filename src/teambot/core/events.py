@@ -54,6 +54,8 @@ class InboundEvent:
 
     Пара ``platform``, ``chat_id`` и ``message_id`` служит ключом
     идемпотентности. Поле ``ts`` должно содержать aware-время в UTC.
+    ``chat_title`` — человекочитаемое имя чата от адаптера, без типа
+    платформы; ядро сохраняет его при привязке для ``/chats``.
     """
 
     platform: str
@@ -67,6 +69,7 @@ class InboundEvent:
     ts: datetime
     raw: dict[str, JsonValue]
     display_name: str | None = None
+    chat_title: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

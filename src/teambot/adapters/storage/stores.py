@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Table, or_, select, update
+from sqlalchemy import Table, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session
 
@@ -32,6 +32,7 @@ from teambot.core.errors import ValidationError
 from teambot.core.models import (
     AccessCode,
     AccessCodePurpose,
+    BoundChat,
     ChatRef,
     EventKey,
     ExternalIdentity,
@@ -89,6 +90,19 @@ def _idea_from_row(row: IdeaRecord, tags: tuple[str, ...]) -> Idea:
 
 def _user_from_row(row: User) -> DomainUser:
     return DomainUser(id=row.id, display_name=row.display_name)
+
+
+MAX_CHAT_TITLE_LENGTH = 300
+
+
+def _clean_chat_title(title: str | None) -> str | None:
+    """Нормализует название чата под ограничение колонки ``chats.title``."""
+    if title is None:
+        return None
+    clean_title = title.strip()
+    if not clean_title:
+        return None
+    return clean_title[:MAX_CHAT_TITLE_LENGTH]
 
 
 class SqlEventDeduplicator:
@@ -269,8 +283,18 @@ class SqlTeamStore:
         display_name = user.display_name if user is not None else str(ctx.user_id)
         return TeamMember(ctx.user_id, display_name, role)
 
-    async def bind_chat(self, ctx: TeamContext, chat: ChatRef) -> None:
-        """Привязывает чат к команде либо подтверждает уже существующую связь."""
+    async def bind_chat(
+        self,
+        ctx: TeamContext,
+        chat: ChatRef,
+        title: str | None = None,
+    ) -> None:
+        """Привязывает чат к команде либо подтверждает уже существующую связь.
+
+        Название обновляется только если передано: повторная привязка без
+        заголовка не затирает ранее сохранённое имя.
+        """
+        clean_title = _clean_chat_title(title)
         async with self._sessions() as session, session.begin():
             existing = await session.scalar(
                 select(Chat).where(
@@ -285,12 +309,23 @@ class SqlTeamStore:
                         team_id=ctx.team_id,
                         platform=chat.source,
                         chat_id=chat.external_chat_id,
-                        title=None,
+                        title=clean_title,
                     )
                 )
                 return
             if existing.team_id != ctx.team_id:
                 raise ValidationError("Чат уже привязан к другой команде")
+            if clean_title is not None:
+                existing.title = clean_title
+
+    async def list_chats(self, ctx: TeamContext) -> list[BoundChat]:
+        """Возвращает привязки только указанной команды."""
+        async with self._sessions() as session:
+            rows = (await session.scalars(select(Chat).where(Chat.team_id == ctx.team_id))).all()
+        chats = [BoundChat(ChatRef(row.platform, row.chat_id), row.title) for row in rows]
+        # Сортировка по непрозрачным идентификаторам, не по отображаемому имени:
+        # правило DB про локаль относится к пользовательскому тексту.
+        return sorted(chats, key=lambda item: (item.ref.source, item.ref.external_chat_id))
 
     async def set_role(self, ctx: TeamContext, user_id: UUID, role: Role) -> TeamMember:
         """Обновляет роль участника в команде контекста."""
@@ -307,6 +342,39 @@ class SqlTeamStore:
             user = await session.get(User, user_id)
         display_name = user.display_name if user is not None else str(user_id)
         return TeamMember(user_id, display_name, role)
+
+    async def remove_member(self, ctx: TeamContext, user_id: UUID) -> None:
+        """Удаляет членство только внутри текущей команды."""
+        async with self._sessions() as session, session.begin():
+            removed_id = (
+                await session.scalars(
+                    delete(Membership)
+                    .where(
+                        Membership.team_id == ctx.team_id,
+                        Membership.user_id == user_id,
+                    )
+                    .returning(Membership.id)
+                )
+            ).first()
+        if removed_id is None:
+            raise ValidationError("Участник не найден")
+
+    async def unbind_chat(self, ctx: TeamContext, chat: ChatRef) -> None:
+        """Удаляет привязку текущего чата к команде контекста."""
+        async with self._sessions() as session, session.begin():
+            removed_id = (
+                await session.scalars(
+                    delete(Chat)
+                    .where(
+                        Chat.team_id == ctx.team_id,
+                        Chat.platform == chat.source,
+                        Chat.chat_id == chat.external_chat_id,
+                    )
+                    .returning(Chat.id)
+                )
+            ).first()
+        if removed_id is None:
+            raise ValidationError("Чат не привязан к этой команде")
 
     async def find_owned_team(self, user_id: UUID) -> TeamContext | None:
         """Возвращает контекст, только если владелецская команда одна."""

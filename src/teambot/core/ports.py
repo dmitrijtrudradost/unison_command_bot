@@ -14,6 +14,7 @@ from teambot.core.events import Attachment, Capabilities, InboundEvent, JsonValu
 from teambot.core.models import (
     AccessCode,
     AccessCodePurpose,
+    BoundChat,
     ChatRef,
     CommandSpec,
     EventKey,
@@ -177,12 +178,29 @@ class TeamStore(Protocol):
         """Добавляет пользователя из контекста в указанную команду."""
         ...
 
-    async def bind_chat(self, ctx: TeamContext, chat: ChatRef) -> None:
+    async def bind_chat(
+        self,
+        ctx: TeamContext,
+        chat: ChatRef,
+        title: str | None = None,
+    ) -> None:
         """Привязывает чат к команде действующего администратора."""
+        ...
+
+    async def list_chats(self, ctx: TeamContext) -> list[BoundChat]:
+        """Возвращает чаты, привязанные только к указанной команде."""
         ...
 
     async def set_role(self, ctx: TeamContext, user_id: UUID, role: Role) -> TeamMember:
         """Изменяет роль участника в области команды администратора."""
+        ...
+
+    async def remove_member(self, ctx: TeamContext, user_id: UUID) -> None:
+        """Удаляет членство пользователя только в указанной команде."""
+        ...
+
+    async def unbind_chat(self, ctx: TeamContext, chat: ChatRef) -> None:
+        """Отвязывает чат от команды действующего администратора."""
         ...
 
     async def find_owned_team(self, user_id: UUID) -> TeamContext | None:
@@ -195,6 +213,18 @@ class TeamStore(Protocol):
 
     async def ensure_owned_team(self, user: User, team_name: str) -> TeamContext:
         """Идемпотентно создаёт команду с пользователем-владельцем."""
+        ...
+
+
+class ChatPresence(Protocol):
+    """Проверяет, может ли канал действовать в уже известном чате."""
+
+    async def is_member(self, chat: ChatRef) -> bool | None:
+        """Возвращает доступность чата без знания о конкретной платформе.
+
+        ``True`` — бот состоит в чате, ``False`` — нет, ``None`` — этот
+        адаптер чат не обслуживает.
+        """
         ...
 
 

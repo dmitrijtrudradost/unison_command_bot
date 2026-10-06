@@ -20,6 +20,7 @@ from teambot.core.errors import (
 from teambot.core.models import (
     AccessCode,
     AccessCodePurpose,
+    BoundChat,
     ChatRef,
     ExternalIdentity,
     NewAccessCode,
@@ -61,12 +62,15 @@ class IdentityService:
         identity: ExternalIdentity,
         display_name: str | None = None,
         chat: ChatRef | None = None,
+        chat_title: str | None = None,
     ) -> User:
         """Возвращает существующего либо создаёт нового пользователя.
 
         Если у пользователя ровно одна команда с ролью владельца, текущий чат
         привязывается автоматически: иначе первый чат нельзя привязать через
         ``/bind``, потому что эта команда сама требует уже известный контекст.
+        Название чата сохраняется при наличии, чтобы ``/chats`` мог показать
+        его без знания о платформе.
         """
         existing = await self._identities.find_user(identity)
         user = existing
@@ -76,7 +80,7 @@ class IdentityService:
                 raise ValidationError("Имя пользователя не может быть пустым")
             user = await self._identities.create_user(identity, clean_name)
         if chat is not None:
-            await self._bind_owned_chat(user.id, chat)
+            await self._bind_owned_chat(user.id, chat, title=chat_title)
         return user
 
     async def bootstrap_owner(
@@ -143,7 +147,13 @@ class IdentityService:
         _require_role(ctx, Role.ADMIN)
         return await self._create_code(ctx, AccessCodePurpose.BIND)
 
-    async def bind_chat(self, user_id: UUID, chat: ChatRef, code: str) -> TeamContext:
+    async def bind_chat(
+        self,
+        user_id: UUID,
+        chat: ChatRef,
+        code: str,
+        title: str | None = None,
+    ) -> TeamContext:
         """Привязывает чат по коду, проверяя роль пользователя в целевой команде."""
         access = await self._valid_code(code, AccessCodePurpose.BIND)
         if access.team_id is None:
@@ -154,7 +164,7 @@ class IdentityService:
         _require_role(ctx, Role.ADMIN)
         if not await self._codes.consume(ctx, access.id):
             raise AccessCodeError
-        await self._teams.bind_chat(ctx, chat)
+        await self._teams.bind_chat(ctx, chat, title=title)
         return ctx
 
     async def create_invite(self, ctx: TeamContext, role: Role = Role.MEMBER) -> AccessCode:
@@ -171,6 +181,7 @@ class IdentityService:
         identity: ExternalIdentity,
         code: str,
         chat: ChatRef | None = None,
+        chat_title: str | None = None,
     ) -> TeamContext:
         """Регистрирует аккаунт при необходимости и принимает приглашение."""
         access = await self._valid_code(code, AccessCodePurpose.INVITE)
@@ -182,13 +193,32 @@ class IdentityService:
             raise AccessCodeError
         await self._teams.add_member(ctx)
         if chat is not None:
-            await self._teams.bind_chat(ctx, chat)
+            await self._teams.bind_chat(ctx, chat, title=chat_title)
         return ctx
 
     async def team(self, ctx: TeamContext) -> tuple[Team, list[TeamMember]]:
         """Возвращает команду и её участников для роли ``member`` и выше."""
         _require_role(ctx, Role.MEMBER)
         return await self._teams.get_team(ctx), await self._teams.list_members(ctx)
+
+    async def list_chats(self, ctx: TeamContext) -> tuple[Team, list[BoundChat]]:
+        """Возвращает привязанные чаты только владельцу команды.
+
+        Список берётся из хранилища привязок: канал не умеет перечислить все
+        чаты, где состоит бот. Присутствие бота проверяет оркестратор через
+        отдельный порт, а не этот метод.
+
+        Аргументы:
+            ctx: контекст владельца текущей команды.
+
+        Возвращает:
+            Команду и её привязанные чаты.
+
+        Исключения:
+            PermissionDenied: роль ниже owner.
+        """
+        _require_role(ctx, Role.OWNER)
+        return await self._teams.get_team(ctx), await self._teams.list_chats(ctx)
 
     async def set_role(self, ctx: TeamContext, user_id: UUID, role: Role) -> TeamMember:
         """Назначает участнику роль с защитой роли владельца."""
@@ -202,6 +232,33 @@ class IdentityService:
         if current.role is Role.OWNER:
             raise PermissionDenied
         return await self._teams.set_role(ctx, user_id, role)
+
+    async def kick(self, ctx: TeamContext, user_id: UUID) -> None:
+        """Исключает участника из текущей команды, не удаляя глобальный аккаунт."""
+        _require_role(ctx, Role.ADMIN)
+        if user_id == ctx.user_id:
+            raise PermissionDenied
+        members = await self._teams.list_members(ctx)
+        current = next((member for member in members if member.user_id == user_id), None)
+        if current is None:
+            raise ValidationError("Участник не найден")
+        if current.role is Role.OWNER:
+            raise PermissionDenied
+        if ctx.role is Role.ADMIN and current.role is Role.ADMIN:
+            raise PermissionDenied
+        await self._teams.remove_member(ctx, user_id)
+
+    async def leave(self, ctx: TeamContext) -> None:
+        """Удаляет членство текущего пользователя; владелец выйти не может."""
+        _require_role(ctx, Role.MEMBER)
+        if ctx.role is Role.OWNER:
+            raise PermissionDenied
+        await self._teams.remove_member(ctx, ctx.user_id)
+
+    async def unbind_chat(self, ctx: TeamContext, chat: ChatRef) -> None:
+        """Отвязывает текущий чат от команды, не удаляя чат в мессенджере."""
+        _require_role(ctx, Role.ADMIN)
+        await self._teams.unbind_chat(ctx, chat)
 
     async def _create_code(
         self,
@@ -232,15 +289,22 @@ class IdentityService:
             raise AccessCodeError
         return access
 
-    async def _bind_owned_chat(self, user_id: UUID, chat: ChatRef) -> None:
+    async def _bind_owned_chat(
+        self,
+        user_id: UUID,
+        chat: ChatRef,
+        title: str | None = None,
+    ) -> None:
         """Привязывает чат к единственной команде, которой пользователь владеет."""
         existing = await self._teams.resolve_chat(user_id, chat)
         if existing is not None:
+            if title is not None:
+                await self._teams.bind_chat(existing, chat, title=title)
             return
         owned = await self._teams.find_owned_team(user_id)
         if owned is None:
             return
-        await self._teams.bind_chat(owned, chat)
+        await self._teams.bind_chat(owned, chat, title=title)
 
 
 def _require_role(ctx: TeamContext, required: Role) -> None:

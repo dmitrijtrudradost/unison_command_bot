@@ -8,7 +8,7 @@ import csv
 import html
 import io
 
-from teambot.core.models import CommandSpec, Idea, Role, Task, Team, TeamMember
+from teambot.core.models import BoundChat, CommandSpec, Idea, Role, Task, Team, TeamMember
 
 START = "Team Bot готов. Используйте /help, чтобы увидеть доступные команды."
 CHANNEL_DISABLED = "Канал мессенджера отключён: токен не задан."
@@ -30,6 +30,10 @@ NO_IDEAS = "Идей не найдено."
 CHAT_BOUND = "Чат привязан к команде."
 ACCOUNT_LINKED = "Аккаунт привязан."
 ROLE_CHANGED = "Роль участника изменена."
+MEMBER_REMOVED = "Участник исключён из команды."
+CHAT_UNBOUND = "Чат отвязан от команды."
+LEFT_TEAM = "Вы вышли из команды."
+NO_CHATS = "Привязанных чатов нет."
 
 
 def format_command_help(command: CommandSpec) -> str:
@@ -102,6 +106,27 @@ def format_ideas(ideas: list[Idea]) -> str:
     if not ideas:
         return NO_IDEAS
     return "\n".join(f"{number}. {idea.text}" for number, idea in enumerate(ideas, start=1))
+
+
+def format_chats(
+    team: Team,
+    chats: list[BoundChat],
+    statuses: list[bool | None],
+) -> str:
+    """Формирует список привязанных чатов и доступности бота в них."""
+    if not chats:
+        return NO_CHATS
+    lines = [f"Чаты команды: {team.name}"]
+    for number, (chat, active) in enumerate(zip(chats, statuses, strict=True), start=1):
+        label = chat.title or chat.ref.external_chat_id
+        if active is True:
+            state = "бот в чате"
+        elif active is False:
+            state = "бот не в чате"
+        else:
+            state = "статус неизвестен"
+        lines.append(f"{number}. {label} ({chat.ref.external_chat_id}) — {state}")
+    return "\n".join(lines)
 
 
 def format_team(team: Team, members: list[TeamMember]) -> str:

@@ -21,6 +21,7 @@ from teambot.adapters.storage.stores import (
 )
 from teambot.core.models import (
     AccessCodePurpose,
+    ChatRef,
     EventKey,
     ExternalIdentity,
     IdeaFilter,
@@ -28,6 +29,7 @@ from teambot.core.models import (
     NewIdea,
     Role,
     TaskStatus,
+    TeamContext,
 )
 from teambot.core.services.tasks import TaskService
 
@@ -129,4 +131,29 @@ async def test_idea_store_filters_by_normalized_text(tmp_path: Path) -> None:
     found = await ideas.list(ctx, IdeaFilter(query_norm="новый"))
     assert len(found) == 1
     assert found[0].tags == ("продукт",)
+    await engine.dispose()
+
+
+async def test_remove_member_and_unbind_chat_are_team_scoped(tmp_path: Path) -> None:
+    engine = await _engine(tmp_path)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    identities = SqlIdentityStore(sessions)
+    teams = SqlTeamStore(sessions)
+    owner = await identities.create_user(ExternalIdentity("src", "owner"), "Owner")
+    member = await identities.create_user(ExternalIdentity("src", "member"), "Member")
+    ctx = await teams.ensure_owned_team(owner, "Team")
+    member_ctx = TeamContext(ctx.team_id, member.id, Role.MEMBER)
+    await teams.add_member(member_ctx)
+    chat = ChatRef("src", "chat-1")
+    await teams.bind_chat(ctx, chat, title="Рабочий чат")
+    bound = await teams.list_chats(ctx)
+    assert len(bound) == 1
+    assert bound[0].ref == chat
+    assert bound[0].title == "Рабочий чат"
+
+    await teams.remove_member(ctx, member.id)
+    assert await teams.get_context(ctx.team_id, member.id) is None
+    await teams.unbind_chat(ctx, chat)
+    assert await teams.resolve_chat(owner.id, chat) is None
+    assert await teams.list_chats(ctx) == []
     await engine.dispose()

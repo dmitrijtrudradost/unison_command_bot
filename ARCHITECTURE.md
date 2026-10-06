@@ -182,6 +182,8 @@ class InboundEvent:
     thread_id: str | None
     ts: datetime                    # UTC
     raw: dict                       # исходный payload, в логи не попадает
+    display_name: str | None = None
+    chat_title: str | None = None   # имя чата от адаптера, для привязки и /chats
 
 @dataclass(frozen=True)
 class OutboundMessage:
@@ -215,6 +217,10 @@ class ChannelAdapter(Protocol):
     async def download(self, attachment: Attachment) -> bytes: ...
     async def publish_commands(self, commands: list[CommandSpec]) -> None: ...
     # публикует меню команд, если платформа это умеет (иначе ничего не делает)
+
+class ChatPresence(Protocol):
+    async def is_member(self, chat: ChatRef) -> bool | None: ...
+    # True — бот в чате, False — нет, None — этот адаптер чат не обслуживает
 
 class MeetingConnector(Protocol):
     platform: str
@@ -371,6 +377,7 @@ Row-Level Security (включается на этапе M2.5; до этого �
 - Один человек может иметь несколько идентификаторов (Telegram, VK, MAX) и состоять в нескольких командах.
 - Привязка аккаунта: одноразовый код или ссылка-приглашение (`/link`).
 - Привязка чата к команде: код привязки, выдаётся администратором (`/bind`).
+- Список привязанных чатов: только owner (`/chats`). Канал не умеет перечислить все группы, где состоит бот; в списке только записи привязки и проверка, может ли бот ещё действовать в этих чатах.
 - Роли:
 
 | Роль | Права |
@@ -405,6 +412,10 @@ Row-Level Security (включается на этапе M2.5; до этого �
 | `/team` | Моя команда | member | M1 | участники и роли |
 | `/invite` | Пригласить в команду | admin | M1 | код или ссылка-приглашение |
 | `/role` | Назначить роль | admin | M1 | |
+| `/kick` | Исключить из команды | admin | M1 | `/kick <uuid>`; нельзя исключить owner |
+| `/unbind` | Отвязать чат от команды | admin | M1 | отвязывает текущий чат, не удаляя группу в мессенджере |
+| `/leave` | Выйти из команды | member | M1 | owner выйти не может |
+| `/chats` | Чаты команды | owner | M1 | привязанные чаты и доступность бота; непривязанные группы не видны |
 | `/remind` | Напоминание | member | M2 | `/remind <номер задачи или текст> <когда>` |
 | `/recap` | Саммари чата | member | M2 | за период, по умолчанию за сутки |
 | `/digest` | Дайджест идей | member | M2 | за период, также по расписанию |
@@ -434,6 +445,10 @@ bind - Привязать чат к команде
 team - Моя команда
 invite - Пригласить в команду
 role - Назначить роль
+kick - Исключить из команды
+unbind - Отвязать чат от команды
+leave - Выйти из команды
+chats - Чаты команды
 ```
 
 Правила:

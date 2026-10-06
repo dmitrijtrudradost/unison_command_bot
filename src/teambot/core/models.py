@@ -129,6 +129,14 @@ class ChatRef:
 
 
 @dataclass(frozen=True, slots=True)
+class BoundChat:
+    """Описывает привязанный к команде внешний чат."""
+
+    ref: ChatRef
+    title: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Team:
     """Представляет рабочую группу."""
 

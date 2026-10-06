@@ -15,7 +15,11 @@ from teambot.core.events import InboundEvent
 from teambot.core.messages import (
     ACCOUNT_LINKED,
     CHAT_BOUND,
+    CHAT_UNBOUND,
     IDEA_ADDED,
+    LEFT_TEAM,
+    MEMBER_REMOVED,
+    NO_CHATS,
     NOT_FOUND,
     PERMISSION_DENIED,
     ROLE_CHANGED,
@@ -57,6 +61,7 @@ def make_event(
     *,
     user_id: str = "user-1",
     chat_id: str = "chat-1",
+    chat_title: str | None = None,
 ) -> InboundEvent:
     return InboundEvent(
         platform="channel-a",
@@ -70,7 +75,16 @@ def make_event(
         ts=datetime.now(UTC),
         raw={},
         display_name="Участник",
+        chat_title=chat_title,
     )
+
+
+class FakePresence:
+    def __init__(self, membership: dict[ChatRef, bool | None]) -> None:
+        self.membership = membership
+
+    async def is_member(self, chat: ChatRef) -> bool | None:
+        return self.membership.get(chat)
 
 
 def build_orchestrator() -> tuple[Orchestrator, FakeTaskStore]:
@@ -113,9 +127,14 @@ def test_m1_registry_has_canonical_order_and_roles() -> None:
         "team",
         "invite",
         "role",
+        "kick",
+        "unbind",
+        "leave",
+        "chats",
     ]
     assert next(command for command in COMMANDS if command.name == "ideas").min_role is Role.VIEWER
     assert next(command for command in COMMANDS if command.name == "bind").min_role is Role.ADMIN
+    assert next(command for command in COMMANDS if command.name == "chats").min_role is Role.OWNER
 
 
 async def test_duplicate_event_does_not_repeat_side_effect() -> None:
@@ -224,12 +243,77 @@ async def test_all_m1_commands_and_permission_errors() -> None:
     )
     assert linked[0].text == ACCOUNT_LINKED
     bound = await orchestrator.handle(
-        make_event("bn", "/bind bind-1", user_id="owner-1", chat_id="chat-3"),
+        make_event("bn", "/bind bind-1", user_id="owner-1", chat_id="chat-3", chat_title="Группа"),
     )
     assert bound[0].text == CHAT_BOUND
+    chats_unknown = await owner("ch0", "/chats")
+    assert "Чаты команды: Команда" in chats_unknown
+    assert "chat-1" in chats_unknown
+    assert "Группа (chat-3) — статус неизвестен" in chats_unknown
+    assert NO_CHATS not in chats_unknown
 
     viewer_add = await orchestrator.handle(
         make_event("va", "/add Нельзя", user_id="member-1", chat_id="chat-2"),
     )
     assert viewer_add[0].text == PERMISSION_DENIED
     assert len(task_store.tasks) == 1
+
+    kick_help = next(command for command in COMMANDS if command.name == "kick")
+    assert await owner("kk", "/kick") == format_invalid_usage(kick_help)
+    kicked = await owner("k1", f"/kick {teams.members[-1].user_id}")
+    assert kicked == MEMBER_REMOVED
+
+    leaver_user = User(uuid4(), "Выходящий")
+    identities.users[ExternalIdentity("channel-a", "leaver")] = leaver_user
+    teams.members.append(TeamMember(leaver_user.id, leaver_user.display_name, Role.MEMBER))
+    left = await orchestrator.handle(make_event("lv", "/leave", user_id="leaver"))
+    assert left[0].text == LEFT_TEAM
+    owner_leave = await orchestrator.handle(
+        make_event("olv", "/leave", user_id="owner-alt", chat_id="chat-1"),
+    )
+    assert owner_leave[0].text == PERMISSION_DENIED
+
+    unbound = await owner("ub", "/unbind")
+    assert unbound == CHAT_UNBOUND
+    after_unbind = await orchestrator.handle(
+        make_event("ub2", "/team", user_id="owner-1"),
+    )
+    assert after_unbind[0].text == "Этот чат не привязан к доступной вам команде."
+
+
+async def test_chats_uses_presence_and_denies_non_owner() -> None:
+    team = Team(uuid4(), "Команда")
+    owner_user = User(uuid4(), "Владелец")
+    member_user = User(uuid4(), "Участник")
+    identities = FakeIdentityStore()
+    identities.users[ExternalIdentity("channel-a", "owner-1")] = owner_user
+    identities.users[ExternalIdentity("channel-a", "member-1")] = member_user
+    owner_chat = ChatRef("channel-a", "chat-1")
+    group_chat = ChatRef("channel-a", "chat-2")
+    teams = FakeTeamStore(
+        team,
+        [
+            TeamMember(owner_user.id, owner_user.display_name, Role.OWNER),
+            TeamMember(member_user.id, member_user.display_name, Role.MEMBER),
+        ],
+    )
+    teams.chats[owner_chat] = team.id
+    teams.chats[group_chat] = team.id
+    teams.chat_titles[group_chat] = "Рабочая группа"
+    orchestrator = Orchestrator(
+        FakeDeduplicator(),
+        IdentityService(identities, teams, FakeAccessCodeStore()),
+        TaskService(FakeTaskStore()),
+        IdeaService(FakeIdeaStore(), FakeIdeaIndex()),
+        presence=FakePresence({owner_chat: True, group_chat: False}),
+    )
+
+    replies = await orchestrator.handle(make_event("c1", "/chats", user_id="owner-1"))
+    text = replies[0].text
+    assert "1. chat-1 (chat-1) — бот в чате" in text
+    assert "2. Рабочая группа (chat-2) — бот не в чате" in text
+
+    denied = await orchestrator.handle(
+        make_event("c2", "/chats", user_id="member-1"),
+    )
+    assert denied[0].text == PERMISSION_DENIED

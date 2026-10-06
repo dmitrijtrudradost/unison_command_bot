@@ -4,9 +4,11 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.methods import SendMessage
-from aiogram.types import Message
+from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.methods import GetChatMember, SendMessage
+from aiogram.types import ChatMemberLeft, ChatMemberMember, Message
+from aiogram.types import User as TelegramUser
 from pydantic import SecretStr
 
 from teambot.adapters.channels.telegram import (
@@ -17,10 +19,12 @@ from teambot.adapters.channels.telegram import (
 )
 from teambot.core.commands import COMMANDS
 from teambot.core.events import Attachment, Capabilities, InboundEvent, OutboundMessage
+from teambot.core.models import ChatRef
 
 
 class RecordingBot:
     def __init__(self) -> None:
+        self.id = 123
         self.messages: list[tuple[int, str, int | None]] = []
         self.documents: list[Any] = []
         self.commands: list[Any] = []
@@ -59,7 +63,12 @@ def test_inbound_event_strips_bot_suffix_and_hides_raw_payload() -> None:
         {
             "message_id": 7,
             "date": datetime(2026, 1, 2, tzinfo=UTC),
-            "chat": {"id": 55, "type": "private"},
+            "chat": {
+                "id": 55,
+                "type": "private",
+                "first_name": "Анна",
+                "last_name": "Иванова",
+            },
             "from": {
                 "id": 99,
                 "is_bot": False,
@@ -78,6 +87,7 @@ def test_inbound_event_strips_bot_suffix_and_hides_raw_payload() -> None:
     assert event.platform_user_id == "99"
     assert event.text == "/start code-1"
     assert event.display_name == "Анна Иванова"
+    assert event.chat_title == "Анна Иванова"
     assert event.raw == {}
 
 
@@ -175,3 +185,57 @@ async def test_publish_commands_and_download() -> None:
     assert [command.command for command in bot.commands] == [item.name for item in COMMANDS]
     assert payload == b"file-bytes"
     assert bot.downloaded == ["file-1"]
+
+
+def test_inbound_event_uses_group_title() -> None:
+    message = Message.model_validate(
+        {
+            "message_id": 9,
+            "date": datetime(2026, 1, 2, tzinfo=UTC),
+            "chat": {"id": -100, "type": "supergroup", "title": "Рабочая группа"},
+            "from": {"id": 99, "is_bot": False, "first_name": "Анна"},
+            "text": "/chats",
+        }
+    )
+
+    event = inbound_event_from_message(message)
+
+    assert event.chat_id == "-100"
+    assert event.chat_title == "Рабочая группа"
+
+
+def _bot_user() -> TelegramUser:
+    return TelegramUser(id=123, is_bot=True, first_name="Bot")
+
+
+async def test_is_member_reports_telegram_presence_only() -> None:
+    class PresenceBot(RecordingBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.members: dict[int, object] = {
+                55: ChatMemberMember(user=_bot_user(), status=ChatMemberStatus.MEMBER),
+                77: ChatMemberLeft(user=_bot_user(), status=ChatMemberStatus.LEFT),
+            }
+
+        async def get_chat_member(self, chat_id: int, user_id: int) -> object:
+            del user_id
+            if chat_id == 88:
+                raise TelegramBadRequest(
+                    method=GetChatMember(chat_id=chat_id, user_id=self.id),
+                    message="Bad Request: chat not found",
+                )
+            if chat_id == 99:
+                raise TelegramForbiddenError(
+                    method=GetChatMember(chat_id=chat_id, user_id=self.id),
+                    message="Forbidden: bot was kicked from the group chat",
+                )
+            return self.members[chat_id]
+
+    adapter = TelegramAdapter(_settings(), bot=cast(Bot, PresenceBot()))
+
+    assert await adapter.is_member(ChatRef("vk", "55")) is None
+    assert await adapter.is_member(ChatRef("telegram", "55")) is True
+    assert await adapter.is_member(ChatRef("telegram", "77")) is False
+    assert await adapter.is_member(ChatRef("telegram", "88")) is False
+    assert await adapter.is_member(ChatRef("telegram", "99")) is False
+    assert await adapter.is_member(ChatRef("telegram", "not-an-id")) is False

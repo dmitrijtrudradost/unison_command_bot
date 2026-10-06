@@ -155,6 +155,42 @@ COMMANDS: tuple[CommandSpec, ...] = (
         "/role <uuid> <роль>",
         "/role 11111111-1111-1111-1111-111111111111 viewer",
     ),
+    CommandSpec(
+        "kick",
+        "Исключить из команды",
+        Role.ADMIN,
+        "M1",
+        "kick",
+        "/kick <uuid>",
+        "/kick 11111111-1111-1111-1111-111111111111",
+    ),
+    CommandSpec(
+        "unbind",
+        "Отвязать чат от команды",
+        Role.ADMIN,
+        "M1",
+        "unbind",
+        "/unbind",
+        "/unbind",
+    ),
+    CommandSpec(
+        "leave",
+        "Выйти из команды",
+        Role.MEMBER,
+        "M1",
+        "leave",
+        "/leave",
+        "/leave",
+    ),
+    CommandSpec(
+        "chats",
+        "Чаты команды",
+        Role.OWNER,
+        "M1",
+        "chats",
+        "/chats",
+        "/chats",
+    ),
 )
 
 _COMMAND_NAME = re.compile(r"^[a-z0-9_]{1,32}$")
